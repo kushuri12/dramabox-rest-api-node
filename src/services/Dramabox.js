@@ -490,30 +490,8 @@ export default class Dramabox {
     const cached = cache.get(cacheKey);
     if (cached) return cached;
 
-    const data = await this.request(
-      `/webfic/book/detail/v2?id=${bookId}&language=${this.lang}`,
-      { id: bookId, language: this.lang },
-      true,
-      "GET"
-    );
-
-    const { chapterList, book } = data?.data || {};
-    const chapters = [];
-    chapterList?.forEach((ch) => {
-      chapters.push({ index: ch.index, id: ch.id });
-    });
-
-    const result = { chapters, drama: book };
-    cache.set(cacheKey, result, CONFIG.CACHE_TTL.DRAMA_DETAIL);
-    return result;
-  }
-
-  async getChapters(bookId) {
-    const cacheKey = `chapters_${bookId}_${this.lang}`;
-    const cached = cache.get(cacheKey);
-    if (cached) return cached;
-
-    const data = await this.request("/drama-box/chapterv2/batch/load", {
+    // Use batch/load index 1 as it contains both book info and chapters
+    const response = await this.request("/drama-box/chapterv2/batch/load", {
       boundaryIndex: 0,
       comingPlaySectionId: -1,
       index: 1,
@@ -527,15 +505,168 @@ export default class Dramabox {
       bookId,
     });
 
-    const chapters = data?.data?.chapterList || [];
-    chapters.forEach((ch) => {
-      const cdn = ch.cdnList?.find((c) => c.isDefault === 1);
-      ch.videoPath =
-        cdn?.videoPathList?.find((v) => v.isDefault === 1)?.videoPath || "N/A";
-    });
+    const data = response?.data || {};
 
-    cache.set(cacheKey, chapters, CONFIG.CACHE_TTL.CHAPTERS);
-    return chapters;
+    // Flatten the structure for frontend compatibility
+    const result = {
+      ...data,
+      id: data.bookId,
+      title: data.bookName,
+      cover: data.bookCover || data.coverWap || data.cover,
+      description: data.introduction || data.introductionWap,
+      episodeCount: data.chapterCount,
+      tags: (data.tagV3s || []).map((tag) =>
+        typeof tag === "object" ? tag.tagName : tag
+      ),
+      chapters: data.chapterList || [],
+    };
+
+    cache.set(cacheKey, result, CONFIG.CACHE_TTL.DRAMA_DETAIL);
+    return result;
+  }
+
+  async getChapters(bookId) {
+    const cacheKey = `chapters_${bookId}_${this.lang}`;
+    const cached = cache.get(cacheKey);
+    if (cached) return cached;
+
+    let allChapters = [];
+    let totalChapters = 0;
+    let currentIndex = 1;
+    let batchCount = 0;
+    const MAX_BATCHES = 200; // Safety limit
+
+    console.log(`[Chapters] Fetching chapters for bookId: ${bookId}`);
+
+    try {
+      // Fetch first batch to get total count
+      const firstBatch = await this.request("/drama-box/chapterv2/batch/load", {
+        boundaryIndex: 0,
+        comingPlaySectionId: -1,
+        index: currentIndex,
+        currencyPlaySource: "discover_new_rec_new",
+        needEndRecommend: 0,
+        currencyPlaySourceName: "",
+        preLoad: false,
+        rid: "",
+        pullCid: "",
+        loadDirection: 0,
+        bookId,
+      });
+
+      totalChapters = firstBatch?.data?.chapterCount || 0;
+      const firstChapters = firstBatch?.data?.chapterList || [];
+
+      if (firstChapters.length > 0) {
+        allChapters.push(...firstChapters);
+      }
+
+      console.log(
+        `[Chapters] Total: ${totalChapters}, First batch: ${firstChapters.length} chapters`
+      );
+
+      // If there are more chapters, fetch them in batches
+      if (totalChapters > allChapters.length) {
+        currentIndex = allChapters.length; // Start from where we left off
+
+        while (currentIndex < totalChapters && batchCount < MAX_BATCHES) {
+          batchCount++;
+
+          try {
+            console.log(
+              `[Chapters] Fetching at index: ${currentIndex} (Total so far: ${allChapters.length})`
+            );
+
+            const batch = await this.request(
+              "/drama-box/chapterv2/batch/load",
+              {
+                boundaryIndex: 0,
+                comingPlaySectionId: -1,
+                index: currentIndex + 1, // API usually expects 1-based index or next starting index
+                currencyPlaySource: "discover_new_rec_new",
+                needEndRecommend: 0,
+                currencyPlaySourceName: "",
+                preLoad: false,
+                rid: "",
+                pullCid: "",
+                loadDirection: 1, // Using 1 like batchDownload
+                bookId,
+              }
+            );
+
+            const chapters = batch?.data?.chapterList || [];
+
+            if (chapters.length > 0) {
+              allChapters.push(...chapters);
+
+              // Remove duplicates immediately to get actual count
+              const tempMap = new Map();
+              allChapters.forEach((ch) => tempMap.set(ch.chapterId, ch));
+              allChapters = Array.from(tempMap.values());
+
+              console.log(
+                `[Chapters] Batch ${batchCount}: Got ${chapters.length} more (Unique total: ${allChapters.length}/${totalChapters})`
+              );
+
+              // If we didn't get new chapters or we've reached the end
+              if (allChapters.length >= totalChapters) {
+                console.log(
+                  `[Chapters] Reached total chapters count (${totalChapters})`
+                );
+                break;
+              }
+
+              // Update index based on what we have
+              currentIndex = allChapters.length;
+            } else {
+              if (currentIndex < totalChapters) {
+                console.log(
+                  `[Chapters] Batch ${batchCount}: Received 0 chapters but haven't reached total. Trying one more jump...`
+                );
+                currentIndex += 5; // Force jump to skip potential holes
+              } else {
+                break;
+              }
+            }
+
+            await delay(300); // Small delay
+          } catch (error) {
+            console.error(
+              `[Chapters] Error fetching batch at index ${currentIndex}:`,
+              error.message
+            );
+            currentIndex += 5;
+            await delay(1000);
+          }
+        }
+      }
+
+      // Remove duplicates and sort
+      const uniqueMap = new Map();
+      allChapters.forEach((ch) => uniqueMap.set(ch.chapterId, ch));
+      const uniqueChapters = Array.from(uniqueMap.values()).sort(
+        (a, b) => (a.chapterIndex || 0) - (b.chapterIndex || 0)
+      );
+
+      // Add videoPath to each chapter
+      uniqueChapters.forEach((ch) => {
+        const cdn =
+          ch.cdnList?.find((c) => c.isDefault === 1) || ch.cdnList?.[0];
+        ch.videoPath =
+          cdn?.videoPathList?.find((v) => v.isDefault === 1)?.videoPath ||
+          "N/A";
+      });
+
+      console.log(
+        `[Chapters] ✅ Total fetched: ${uniqueChapters.length}/${totalChapters} chapters`
+      );
+
+      cache.set(cacheKey, uniqueChapters, CONFIG.CACHE_TTL.CHAPTERS);
+      return uniqueChapters;
+    } catch (error) {
+      console.error(`[Chapters] Error fetching chapters:`, error.message);
+      throw error;
+    }
   }
 
   async batchDownload(bookId) {
