@@ -1,5 +1,8 @@
 import path from "path";
 import { fileURLToPath } from "url";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -10,5 +13,5 @@ export const config = {
   rootPath: path.resolve(__dirname, "../../"),
   publicPath: path.join(path.resolve(__dirname, "../../"), "public"),
   viewsPath: path.join(path.resolve(__dirname, "../../"), "views"),
-  defaultLang: process.env.DEFAULT_LANG || "in",
+  defaultLang: process.env.DEFAULT_LANG || "id",
 };
